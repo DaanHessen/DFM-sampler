@@ -1,14 +1,17 @@
 """
-Dilated Flow-Matching Solver (DFM-Solver)
-==========================================
+DFM-Solver v2 — Dilated Flow-Matching Sampler
+===============================================
 
-A higher-order ODE solver for flow-matching / velocity-field models (MMDiT, Flux, SD3, etc.)
-with integrated FFT high-frequency detail injection and continuous covariance matching
-for seamless inpainting blending.
+A novel sampler for flow-matching / Rectified Flow models (Qwen-image, Flux,
+SD3, etc.) that combines four quality-enhancing techniques:
 
-Uses ComfyUI's CFGGuider + Sampler interface so all conditioning preprocessing
-(convert_cond, process_conds, encode_model_conds, area/mask resolution, hooks,
-ControlNet, etc.) is handled natively by ComfyUI.
+  1. RF-native sigma-ratio interpolation (matches model training)
+  2. 2nd-order multi-step predictor (zero extra model evals)
+  3. Dynamic thresholding (percentile clamping, prevents CFG artifacts)
+  4. Restart sampling (re-noise + re-denoise for detail refinement)
+
+Uses ComfyUI's CFGGuider + Sampler interface so all conditioning is handled
+natively by ComfyUI.
 
 Author: DFM-Solver Contributors
 License: MIT
@@ -16,38 +19,94 @@ License: MIT
 
 from __future__ import annotations
 
-import math
-from typing import Callable, Optional
+import logging
+from typing import Optional
 
 import torch
 from torch import Tensor
-import comfy.samplers  # type: ignore[import-untyped]
-from comfy.utils import model_trange as trange
+import comfy.samplers
 import comfy.model_management
+import comfy.model_sampling
+from comfy.utils import model_trange as trange
 
+log = logging.getLogger("DFM-Solver")
+
+
+# =========================================================================
+#  Utility functions
+# =========================================================================
+
+def _get_ancestral_step_rf(sigma_from: Tensor, sigma_to: Tensor, eta: float = 1.0):
+    """Compute sigma_down and renoise coefficient for RF (Rectified Flow) ancestral step.
+
+    Adapted from sample_euler_ancestral_RF in k-diffusion.
+    """
+    if eta <= 0 or sigma_to == 0:
+        return sigma_to, torch.zeros_like(sigma_to)
+
+    downstep_ratio = 1 + (sigma_to / sigma_from - 1) * eta
+    sigma_down = sigma_to * downstep_ratio
+    alpha_next = 1 - sigma_to
+    alpha_down = 1 - sigma_down
+    renoise_coeff = (sigma_to ** 2 - sigma_down ** 2 * alpha_next ** 2 / alpha_down ** 2) ** 0.5
+    return sigma_down, renoise_coeff
+
+
+def _default_noise_sampler(x: Tensor, seed: Optional[int] = None):
+    """Create a reproducible noise sampler matching k-diffusion's convention."""
+    if seed is not None:
+        generator = torch.Generator(device=x.device)
+        generator.manual_seed(seed + (1 if x.device == torch.device("cpu") else 0))
+    else:
+        generator = None
+
+    def sampler(sigma, sigma_next):
+        return torch.randn(x.size(), dtype=x.dtype, layout=x.layout,
+                           device=x.device, generator=generator)
+    return sampler
+
+
+def _dynamic_threshold(denoised: Tensor, percentile: float = 0.995) -> Tensor:
+    """Percentile-based dynamic thresholding (Imagen technique).
+
+    Clamps the denoised prediction to the `percentile`-th magnitude,
+    then rescales so values fill the valid range.  Prevents CFG-induced
+    oversaturation and color drift without destroying detail.
+    """
+    if percentile >= 1.0:
+        return denoised
+
+    # Compute per-sample threshold
+    flat = denoised.flatten(1).abs()
+    s = torch.quantile(flat, percentile, dim=1)
+    s = torch.clamp(s, min=1.0)  # don't shrink values that are already fine
+    s = s.reshape(-1, *([1] * (denoised.ndim - 1)))
+
+    return denoised.clamp(-s, s) / s
+
+
+# =========================================================================
+#  DFM Sampler v2
+# =========================================================================
 
 class DFMSampler(comfy.samplers.Sampler):
-    """ComfyUI Sampler subclass implementing the DFM-Solver ODE integration.
+    """ComfyUI Sampler implementing the DFM-Solver v2 pipeline.
 
-    Plugs into CFGGuider.outer_sample() which handles all conditioning
-    preprocessing automatically.
+    Combines RF-native interpolation, 2nd-order multi-step prediction,
+    dynamic thresholding, and restart sampling.
     """
 
     def __init__(
         self,
-        dilation_strength: float = 0.7,
-        fft_injection_strength: float = 0.15,
-        fft_highpass_ratio: float = 0.35,
-        covariance_weight: float = 0.0,
-        use_rk4: bool = True,
-        effective_low_vram: bool = False,
+        eta: float = 0.5,
+        s_noise: float = 1.0,
+        restart_segments: int = 1,
+        dynamic_threshold: float = 0.995,
     ) -> None:
-        self.dilation_strength = max(0.0, min(dilation_strength, 1.0))
-        self.fft_injection_strength = max(0.0, fft_injection_strength)
-        self.fft_highpass_ratio = max(0.0, min(fft_highpass_ratio, 1.0))
-        self.covariance_weight = max(0.0, min(covariance_weight, 1.0))
-        self.use_rk4 = use_rk4
-        self.effective_low_vram = effective_low_vram
+        self.eta = max(0.0, eta)
+        self.s_noise = max(0.0, s_noise)
+        self.restart_segments = max(1, int(restart_segments))
+        self.dynamic_threshold_pct = min(1.0, max(0.0, dynamic_threshold))
 
     # ------------------------------------------------------------------ #
     #  Sampler interface (called by CFGGuider.inner_sample)
@@ -65,273 +124,177 @@ class DFMSampler(comfy.samplers.Sampler):
         denoise_mask=None,
         disable_pbar=False,
     ) -> Tensor:
-        """Entry point called by CFGGuider after conditioning is prepared.
-
-        Args:
-            model_wrap: CFGGuider callable  ``(x, sigma, **extra_args) → denoised``.
-            sigmas: 1-D tensor of sigma values (high → 0).
-            extra_args: Dict with ``model_options``, ``seed``, etc.
-            callback: Progress callback ``(step_info_dict) → None``.
-            noise: Initial noise tensor.
-            latent_image: Original latent for img2img / inpainting.
-            denoise_mask: Mask from ComfyUI's inpainting pipeline.
-            disable_pbar: (unused, for API compat).
-
-        Returns:
-            Denoised samples tensor.
-        """
-        # --- KSamplerX0Inpaint wrapping (handles denoise_mask compositing) ---
+        # --- Inpaint wrapping ---
         model_k = comfy.samplers.KSamplerX0Inpaint(model_wrap, sigmas)
         model_k.latent_image = latent_image
         model_k.noise = noise
+        extra_args = dict(extra_args) if extra_args is not None else {}
         extra_args["denoise_mask"] = denoise_mask
 
-        # --- Apply noise scaling (same as built-in KSampler) ---
+        # --- Initial noise scaling ---
         x = model_wrap.inner_model.model_sampling.noise_scaling(
             sigmas[0], noise, latent_image,
             self.max_denoise(model_wrap, sigmas),
         )
 
-        n_steps = len(sigmas) - 1
-        model_options = extra_args.get("model_options", {})
+        log.info("DFM-Solver v2: x=%s, sigmas=[%.4f → %.4f], %d steps, "
+                 "eta=%.2f, restarts=%d, threshold=%.3f",
+                 list(x.shape), sigmas[0].item(), sigmas[-1].item(),
+                 len(sigmas) - 1, self.eta, self.restart_segments,
+                 self.dynamic_threshold_pct)
+
+        # --- Setup ---
         seed = extra_args.get("seed", None)
+        noise_sampler = _default_noise_sampler(x, seed=seed)
+        s_in = x.new_ones([x.shape[0]])
+        n_steps = len(sigmas) - 1
 
-        for i in trange(n_steps, disable=disable_pbar):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
+        # --- Split sigmas into restart segments ---
+        segments = self._split_into_segments(sigmas, self.restart_segments)
 
-            # --- ODE integration step ---
-            if self.use_rk4:
-                x, denoised = self._rk4_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
-            else:
-                x, denoised = self._euler_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
+        global_step = 0
+        for seg_idx, seg_sigmas in enumerate(segments):
+            # On restart segments (seg_idx > 0), add noise back
+            if seg_idx > 0:
+                restart_sigma = seg_sigmas[0]
+                log.info("DFM restart: re-noising to sigma=%.4f", restart_sigma.item())
+                # Re-noise: x_noisy = sigma * noise + (1 - sigma) * x_clean
+                fresh_noise = noise_sampler(restart_sigma, restart_sigma)
+                x = model_wrap.inner_model.model_sampling.noise_scaling(
+                    restart_sigma, fresh_noise, x, max_denoise=False,
+                )
 
-            # --- FFT high-frequency detail injection ---
-            x = self._fft_detail_injection(x)
+            # Run the segment
+            x, global_step = self._run_segment(
+                model_k, x, seg_sigmas, extra_args,
+                callback, noise_sampler, s_in,
+                n_steps, global_step, disable_pbar,
+            )
 
-            # --- Covariance matching (when mask is present) ---
-            if denoise_mask is not None and self.covariance_weight > 0.0:
-                x = self._covariance_match(x, denoise_mask, self.covariance_weight)
-
-            # --- Progress callback ---
-            if callback is not None:
-                callback({
-                    "x": x,
-                    "i": i,
-                    "sigma": sigma,
-                    "sigma_hat": sigma,
-                    "denoised": denoised,
-                })
-
-            if self.effective_low_vram:
-                comfy.model_management.soft_empty_cache()
-
+        # --- Final inverse noise scaling ---
         x = model_wrap.inner_model.model_sampling.inverse_noise_scaling(
             sigmas[-1], x,
         )
         return x
 
     # ------------------------------------------------------------------ #
-    #  ODE integration steps
+    #  Core sampling loop for one segment
+    # ------------------------------------------------------------------ #
+
+    def _run_segment(
+        self,
+        model_k,
+        x: Tensor,
+        sigmas: Tensor,
+        extra_args: dict,
+        callback,
+        noise_sampler,
+        s_in: Tensor,
+        total_steps: int,
+        global_step: int,
+        disable_pbar: bool,
+    ) -> tuple[Tensor, int]:
+        """Run RF-native 2nd-order sampling over one sigma segment."""
+        old_denoised = None
+        old_sigma = None
+        seg_steps = len(sigmas) - 1
+
+        for i in trange(seg_steps, disable=disable_pbar):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+
+            # --- Model evaluation ---
+            denoised = model_k(x, sigma * s_in, **extra_args)
+
+            # --- Dynamic thresholding on the denoised prediction ---
+            denoised = _dynamic_threshold(denoised, self.dynamic_threshold_pct)
+
+            # --- Progress callback ---
+            # latent_preview.prepare_callback expects: (step, x0, x, total_steps)
+            if callback is not None:
+                callback(global_step, denoised, x, total_steps)
+
+            # --- Terminal step: just output denoised ---
+            if sigma_next == 0:
+                x = denoised
+                global_step += 1
+                old_denoised = denoised
+                old_sigma = sigma
+                continue
+
+            # --- Compute ancestral step (noise level + renoise amount) ---
+            sigma_down, renoise_coeff = _get_ancestral_step_rf(
+                sigma, sigma_next, eta=self.eta,
+            )
+
+            # --- RF-native step with 2nd-order correction ---
+            sigma_ratio = sigma_down / sigma
+
+            if old_denoised is not None and old_sigma is not None:
+                # 2nd-order multi-step: use previous denoised for correction
+                # Based on DPM-Solver++(2M) adapted for RF interpolation
+                #
+                # The key insight: we can use the previous denoised prediction
+                # to build a 2nd-order estimate WITHOUT any extra model evals.
+                h = sigma_down - sigma
+                h_last = sigma - old_sigma
+                r = h_last / h if abs(h.item()) > 1e-8 else torch.tensor(1.0)
+
+                # 2nd-order corrected denoised
+                denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+
+                # RF-native interpolation with corrected prediction
+                x = sigma_ratio * x + (1 - sigma_ratio) * denoised_d
+            else:
+                # 1st step: simple RF interpolation (Euler equivalent)
+                x = sigma_ratio * x + (1 - sigma_ratio) * denoised
+
+            # --- Ancestral noise injection ---
+            if self.eta > 0 and renoise_coeff > 0:
+                alpha_next = 1 - sigma_next
+                alpha_down = 1 - sigma_down
+                x = (alpha_next / alpha_down) * x + \
+                    noise_sampler(sigma, sigma_next) * self.s_noise * renoise_coeff
+
+            # --- Bookkeeping ---
+            old_denoised = denoised
+            old_sigma = sigma
+            global_step += 1
+
+            comfy.model_management.soft_empty_cache()
+
+        return x, global_step
+
+    # ------------------------------------------------------------------ #
+    #  Restart segment splitting
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _to_d(x: Tensor, sigma: Tensor, denoised: Tensor) -> Tensor:
-        """Convert denoised prediction → ODE derivative: dx/dσ = (x − x̂₀)/σ"""
-        # Broadcast sigma to x's shape
-        s = sigma.reshape(-1, *([1] * (x.ndim - 1)))
-        return (x - denoised) / s.clamp(min=1e-7)
+    def _split_into_segments(sigmas: Tensor, n_segments: int) -> list[Tensor]:
+        """Split a sigma schedule into N restart segments.
 
-    @torch.inference_mode()
-    def _rk4_step(
-        self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
-        model_options: dict, seed, denoise_mask,
-    ) -> tuple[Tensor, Tensor]:
-        """4th-order Runge-Kutta integration step (4 model evaluations)."""
-        h = sigma_next - sigma
-        s_in = x.new_ones([x.shape[0]])
-        
-        denoised_cache = {}
+        For n_segments=1, returns [sigmas] (no restart).
+        For n_segments=2, splits at the midpoint: the first segment runs to
+        the midpoint, then restart re-noises to that level and re-runs.
+        """
+        if n_segments <= 1:
+            return [sigmas]
 
-        def f(x_in: Tensor, s: Tensor) -> Tensor:
-            s_safe = s.clamp(min=1e-7)
-            denoised = model_k(x_in, s_safe * s_in, denoise_mask, model_options=model_options, seed=seed)
-            if self.effective_low_vram:
-                comfy.model_management.soft_empty_cache()
-            denoised_cache["latest"] = denoised
-            d = self._to_d(x_in, s_safe * s_in, denoised)
-            if self.effective_low_vram:
-                del denoised
-            return d
+        n_steps = len(sigmas) - 1
+        if n_steps < 2:
+            return [sigmas]
 
-        s_mid = sigma + 0.5 * h
-        k1 = f(x, sigma)
+        segments = []
+        # First segment: full schedule (gets the overall structure right)
+        segments.append(sigmas)
 
-        if self.effective_low_vram:
-            x_next = x + (h / 6.0) * k1
-            x_mid = x + 0.5 * h * k1
-            del k1
-            comfy.model_management.soft_empty_cache()
+        # Restart segments: re-run from a midpoint in the schedule
+        for seg in range(1, n_segments):
+            # Restart from progressively later points to refine details
+            # e.g. with 2 segments: restart from ~40% through schedule
+            # e.g. with 3 segments: restart from ~40% and ~70%
+            fraction = 0.3 + 0.3 * (seg / n_segments)
+            restart_idx = max(1, min(n_steps - 1, int(fraction * n_steps)))
+            segments.append(sigmas[restart_idx:])
 
-            k2 = f(x_mid, s_mid)
-            x_next += (h / 6.0) * 2.0 * k2
-            x_mid = x + 0.5 * h * k2
-            del k2
-            comfy.model_management.soft_empty_cache()
-
-            k3 = f(x_mid, s_mid)
-            x_next += (h / 6.0) * 2.0 * k3
-            x_end = x + h * k3
-            del k3
-            comfy.model_management.soft_empty_cache()
-
-            k4 = f(x_end, sigma_next)
-            x_next += (h / 6.0) * k4
-            del k4
-            comfy.model_management.soft_empty_cache()
-
-            return x_next, denoised_cache["latest"]
-        else:
-            k2 = f(x + 0.5 * h * k1, s_mid)
-            k3 = f(x + 0.5 * h * k2, s_mid)
-            k4 = f(x + h * k3, sigma_next)
-
-            return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), denoised_cache["latest"]
-
-    @torch.inference_mode()
-    def _euler_step(
-        self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
-        model_options: dict, seed, denoise_mask,
-    ) -> tuple[Tensor, Tensor]:
-        """1st-order Euler step (1 model evaluation)."""
-        s_in = x.new_ones([x.shape[0]])
-        denoised = model_k(x, sigma * s_in, denoise_mask, model_options=model_options, seed=seed)
-        d = self._to_d(x, sigma * s_in, denoised)
-        return x + d * (sigma_next - sigma), denoised
-
-    # ------------------------------------------------------------------ #
-    #  FFT High-Frequency Detail Injection
-    # ------------------------------------------------------------------ #
-
-    def _fft_detail_injection(self, x: Tensor) -> Tensor:
-        """Amplify high-frequency content via spectral high-pass filtering."""
-        if self.fft_injection_strength <= 0.0:
-            return x
-
-        device = x.device
-        if self.effective_low_vram:
-            x = x.cpu()
-
-        H, W = x.shape[-2:]
-        x_freq = torch.fft.rfft2(x, norm="ortho")
-
-        freq_h = torch.fft.fftfreq(H, device=x.device, dtype=x.dtype)
-        freq_w = torch.fft.rfftfreq(W, device=x.device, dtype=x.dtype)
-        grid_h, grid_w = torch.meshgrid(freq_h, freq_w, indexing="ij")
-        radius = torch.sqrt(grid_h ** 2 + grid_w ** 2)
-
-        max_radius = math.sqrt(0.5)
-        radius_norm = radius / max_radius
-
-        sharpness = 10.0
-        highpass_mask = torch.sigmoid(sharpness * (radius_norm - self.fft_highpass_ratio))
-        for _ in range(x.ndim - 2):
-            highpass_mask = highpass_mask.unsqueeze(0)
-
-        amplification = 1.0 + self.fft_injection_strength * highpass_mask
-        x_freq_boosted = x_freq * amplification
-        result = torch.fft.irfft2(x_freq_boosted, s=(H, W), norm="ortho")
-        
-        if self.effective_low_vram:
-            result = result.to(device)
-            
-        return result
-
-    # ------------------------------------------------------------------ #
-    #  Continuous Covariance Matching
-    # ------------------------------------------------------------------ #
-
-    def _covariance_match(self, x: Tensor, mask: Tensor, weight: float) -> Tensor:
-        """Per-channel affine covariance matching between masked/unmasked regions."""
-        if weight <= 0.0:
-            return x
-
-        device = x.device
-        if self.effective_low_vram:
-            x = x.cpu()
-            mask = mask.cpu()
-
-        mask_f = mask.float()
-        if mask_f.ndim < x.ndim:
-            # Expand mask dims to match x ([B, H, W] → [B, 1, ..., H, W])
-            while mask_f.ndim < x.ndim:
-                mask_f = mask_f.unsqueeze(1)
-        mask_f = mask_f.expand_as(x)
-        inv_mask_f = 1.0 - mask_f
-        eps = 1e-6
-
-        spatial_dims = tuple(range(2, x.ndim))
-
-        orig_count = inv_mask_f.sum(dim=spatial_dims, keepdim=True).clamp(min=1.0)
-        orig_mean = (x * inv_mask_f).sum(dim=spatial_dims, keepdim=True) / orig_count
-        orig_var = (((x - orig_mean) ** 2) * inv_mask_f).sum(dim=spatial_dims, keepdim=True) / orig_count
-        orig_std = (orig_var + eps).sqrt()
-
-        gen_count = mask_f.sum(dim=spatial_dims, keepdim=True).clamp(min=1.0)
-        gen_mean = (x * mask_f).sum(dim=spatial_dims, keepdim=True) / gen_count
-        gen_var = (((x - gen_mean) ** 2) * mask_f).sum(dim=spatial_dims, keepdim=True) / gen_count
-        gen_std = (gen_var + eps).sqrt()
-
-        x_normalised = (x - gen_mean) / gen_std
-        x_matched = x_normalised * orig_std + orig_mean
-
-        mask_bool = mask_f.bool()
-        x_out = x.clone()
-        x_out[mask_bool] = x[mask_bool] * (1.0 - weight) + x_matched[mask_bool] * weight
-        
-        if self.effective_low_vram:
-            x_out = x_out.to(device)
-            
-        return x_out
-
-
-# =========================================================================
-#  Sigma schedule with cosine dilation
-# =========================================================================
-
-def apply_dilation(
-    sigmas: Tensor,
-    dilation: float,
-) -> Tensor:
-    """Interpolate an existing sigma sequence using cosine dilation warping.
-    
-    Concentrates evaluations in the high-curvature mid-region.
-    """
-    d = max(0.0, min(dilation, 1.0))
-    if d <= 0.0:
-        return sigmas
-        
-    device, dtype = sigmas.device, sigmas.dtype
-    steps = len(sigmas) - 1
-    if steps < 1:
-        return sigmas
-
-    u = torch.linspace(0.0, 1.0, steps + 1, device=device, dtype=torch.float64)
-    # Warped evaluation points (normalized mathematical time axis)
-    linear_part = u
-    cosine_part = (1.0 - torch.cos(math.pi * u)) / 2.0
-    warped_u = (1.0 - d) * linear_part + d * cosine_part
-    
-    warped_u_scaled = warped_u * steps
-    indices = warped_u_scaled.long()
-    frac = (warped_u_scaled - indices).to(dtype)
-    indices = indices.clamp(0, steps - 1)
-    
-    # Linear interpolation at warped coordinates
-    sigmas_warped = sigmas[indices] * (1.0 - frac) + sigmas[indices + 1] * frac
-    
-    # Preserve exact endpoints to guarantee proper zero-point transitions
-    sigmas_warped[0] = sigmas[0]
-    sigmas_warped[-1] = sigmas[-1]
-    
-    return sigmas_warped.to(dtype)
+        return segments
