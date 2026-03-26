@@ -21,8 +21,8 @@ from typing import Callable, Optional
 
 import torch
 from torch import Tensor
-
 import comfy.samplers  # type: ignore[import-untyped]
+from comfy.utils import model_trange as trange
 
 
 class DFMSampler(comfy.samplers.Sampler):
@@ -92,15 +92,15 @@ class DFMSampler(comfy.samplers.Sampler):
         model_options = extra_args.get("model_options", {})
         seed = extra_args.get("seed", None)
 
-        for i in range(n_steps):
+        for i in trange(n_steps, disable=disable_pbar):
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1]
 
             # --- ODE integration step ---
             if self.use_rk4:
-                x = self._rk4_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
+                x, denoised = self._rk4_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
             else:
-                x = self._euler_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
+                x, denoised = self._euler_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
 
             # --- FFT high-frequency detail injection ---
             x = self._fft_detail_injection(x)
@@ -116,7 +116,7 @@ class DFMSampler(comfy.samplers.Sampler):
                     "i": i,
                     "sigma": sigma,
                     "sigma_hat": sigma,
-                    "denoised": x,
+                    "denoised": denoised,
                 })
 
         x = model_wrap.inner_model.model_sampling.inverse_noise_scaling(
@@ -138,14 +138,17 @@ class DFMSampler(comfy.samplers.Sampler):
     def _rk4_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
         model_options: dict, seed, denoise_mask,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """4th-order Runge-Kutta integration step (4 model evaluations)."""
         h = sigma_next - sigma
         s_in = x.new_ones([x.shape[0]])
+        
+        denoised_cache = {}
 
         def f(x_in: Tensor, s: Tensor) -> Tensor:
             s_safe = s.clamp(min=1e-7)
             denoised = model_k(x_in, s_safe * s_in, denoise_mask, model_options=model_options, seed=seed)
+            denoised_cache["latest"] = denoised
             return self._to_d(x_in, s_safe * s_in, denoised)
 
         s_mid = sigma + 0.5 * h
@@ -154,17 +157,17 @@ class DFMSampler(comfy.samplers.Sampler):
         k3 = f(x + 0.5 * h * k2, s_mid)
         k4 = f(x + h * k3, sigma_next)
 
-        return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), denoised_cache["latest"]
 
     def _euler_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
         model_options: dict, seed, denoise_mask,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """1st-order Euler step (1 model evaluation)."""
         s_in = x.new_ones([x.shape[0]])
         denoised = model_k(x, sigma * s_in, denoise_mask, model_options=model_options, seed=seed)
         d = self._to_d(x, sigma * s_in, denoised)
-        return x + d * (sigma_next - sigma)
+        return x + d * (sigma_next - sigma), denoised
 
     # ------------------------------------------------------------------ #
     #  FFT High-Frequency Detail Injection
@@ -239,31 +242,39 @@ class DFMSampler(comfy.samplers.Sampler):
 #  Sigma schedule with cosine dilation
 # =========================================================================
 
-def compute_dilated_sigmas(
-    model_sampling,
-    steps: int,
-    dilation_strength: float,
-    device: torch.device,
+def apply_dilation(
+    sigmas: Tensor,
+    dilation: float,
 ) -> Tensor:
-    """Compute a cosine-dilated sigma schedule using the model's sigma range.
-
+    """Interpolate an existing sigma sequence using cosine dilation warping.
+    
     Concentrates evaluations in the high-curvature mid-region.
     """
-    d = max(0.0, min(dilation_strength, 1.0))
-
-    # Get sigmas from model's normal schedule, then warp them
-    sigma_max = float(model_sampling.sigma_max)
-    sigma_min = float(model_sampling.sigma_min)
+    d = max(0.0, min(dilation, 1.0))
+    if d <= 0.0:
+        return sigmas
+        
+    device, dtype = sigmas.device, sigmas.dtype
+    steps = len(sigmas) - 1
+    if steps < 1:
+        return sigmas
 
     u = torch.linspace(0.0, 1.0, steps + 1, device=device, dtype=torch.float64)
+    # Warped evaluation points (normalized mathematical time axis)
     linear_part = u
     cosine_part = (1.0 - torch.cos(math.pi * u)) / 2.0
-    warped = (1.0 - d) * linear_part + d * cosine_part
-
-    sigmas = sigma_max + (sigma_min - sigma_max) * warped
-    # Append a final 0.0 sigma if sigma_min is very close to 0
-    sigmas_list = sigmas.tolist()
-    if sigmas_list[-1] > 1e-6:
-        sigmas_list.append(0.0)
-
-    return torch.FloatTensor(sigmas_list).to(device)
+    warped_u = (1.0 - d) * linear_part + d * cosine_part
+    
+    warped_u_scaled = warped_u * steps
+    indices = warped_u_scaled.long()
+    frac = (warped_u_scaled - indices).to(dtype)
+    indices = indices.clamp(0, steps - 1)
+    
+    # Linear interpolation at warped coordinates
+    sigmas_warped = sigmas[indices] * (1.0 - frac) + sigmas[indices + 1] * frac
+    
+    # Preserve exact endpoints to guarantee proper zero-point transitions
+    sigmas_warped[0] = sigmas[0]
+    sigmas_warped[-1] = sigmas[-1]
+    
+    return sigmas_warped.to(dtype)

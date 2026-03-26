@@ -14,8 +14,9 @@ import torch
 
 import comfy.samplers  # type: ignore[import-untyped]
 import comfy.sample  # type: ignore[import-untyped]
+import latent_preview
 
-from .dfm_sampler import DFMSampler, compute_dilated_sigmas
+from .dfm_sampler import DFMSampler, apply_dilation
 
 
 CATEGORY = "sampling/dfm"
@@ -45,6 +46,7 @@ class DFMSamplerNode:
                 "cfg": ("FLOAT", {
                     "default": 7.5, "min": 0.0, "max": 30.0, "step": 0.5,
                 }),
+                "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
                 "dilation_strength": ("FLOAT", {
                     "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Timestep dilation. 0 = uniform, 1 = full cosine.",
@@ -77,6 +79,7 @@ class DFMSamplerNode:
         seed: int,
         steps: int,
         cfg: float,
+        scheduler: str,
         dilation_strength: float,
         fft_injection_strength: float,
         fft_highpass_ratio: float,
@@ -102,9 +105,8 @@ class DFMSamplerNode:
 
         # --- Compute dilated sigma schedule ---
         model_sampling = model.get_model_object("model_sampling")
-        sigmas = compute_dilated_sigmas(
-            model_sampling, steps, dilation_strength, device,
-        )
+        sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps).to(device)
+        sigmas = apply_dilation(sigmas, dilation_strength)
 
         # --- Use CFGGuider (handles all conditioning preprocessing) ---
         guider = comfy.samplers.CFGGuider(model)
@@ -114,11 +116,13 @@ class DFMSamplerNode:
         # Fix empty latent channels if needed
         latent = comfy.sample.fix_empty_latent_channels(model, latent)
 
+        callback = latent_preview.prepare_callback(model, sigmas.shape[-1] - 1)
+
         # --- Run sampling through the full ComfyUI pipeline ---
         result = guider.sample(
             noise, latent, sampler, sigmas,
             denoise_mask=noise_mask,
-            callback=None,
+            callback=callback,
             disable_pbar=False,
             seed=seed,
         )
@@ -152,6 +156,7 @@ class DFMInpaintSamplerNode:
                 "cfg": ("FLOAT", {
                     "default": 7.5, "min": 0.0, "max": 30.0, "step": 0.5,
                 }),
+                "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
                 "dilation_strength": ("FLOAT", {
                     "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
                 }),
@@ -186,6 +191,7 @@ class DFMInpaintSamplerNode:
         seed: int,
         steps: int,
         cfg: float,
+        scheduler: str,
         dilation_strength: float,
         fft_injection_strength: float,
         fft_highpass_ratio: float,
@@ -215,9 +221,8 @@ class DFMInpaintSamplerNode:
 
         # --- Sigmas ---
         model_sampling = model.get_model_object("model_sampling")
-        sigmas = compute_dilated_sigmas(
-            model_sampling, steps, dilation_strength, device,
-        )
+        sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps).to(device)
+        sigmas = apply_dilation(sigmas, dilation_strength)
 
         # --- CFGGuider ---
         guider = comfy.samplers.CFGGuider(model)
@@ -226,10 +231,12 @@ class DFMInpaintSamplerNode:
 
         latent = comfy.sample.fix_empty_latent_channels(model, latent)
 
+        callback = latent_preview.prepare_callback(model, sigmas.shape[-1] - 1)
+
         result = guider.sample(
             noise, latent, sampler, sigmas,
             denoise_mask=noise_mask,
-            callback=None,
+            callback=callback,
             disable_pbar=False,
             seed=seed,
         )
