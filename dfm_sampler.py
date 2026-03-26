@@ -98,9 +98,9 @@ class DFMSampler(comfy.samplers.Sampler):
 
             # --- ODE integration step ---
             if self.use_rk4:
-                x = self._rk4_step(model_k, x, sigma, sigma_next, model_options, seed)
+                x = self._rk4_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
             else:
-                x = self._euler_step(model_k, x, sigma, sigma_next, model_options, seed)
+                x = self._euler_step(model_k, x, sigma, sigma_next, model_options, seed, denoise_mask)
 
             # --- FFT high-frequency detail injection ---
             x = self._fft_detail_injection(x)
@@ -137,7 +137,7 @@ class DFMSampler(comfy.samplers.Sampler):
 
     def _rk4_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
-        model_options: dict, seed,
+        model_options: dict, seed, denoise_mask,
     ) -> Tensor:
         """4th-order Runge-Kutta integration step (4 model evaluations)."""
         h = sigma_next - sigma
@@ -145,7 +145,7 @@ class DFMSampler(comfy.samplers.Sampler):
 
         def f(x_in: Tensor, s: Tensor) -> Tensor:
             s_safe = s.clamp(min=1e-7)
-            denoised = model_k(x_in, s_safe * s_in, model_options=model_options, seed=seed)
+            denoised = model_k(x_in, s_safe * s_in, denoise_mask, model_options=model_options, seed=seed)
             return self._to_d(x_in, s_safe * s_in, denoised)
 
         s_mid = sigma + 0.5 * h
@@ -158,11 +158,11 @@ class DFMSampler(comfy.samplers.Sampler):
 
     def _euler_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
-        model_options: dict, seed,
+        model_options: dict, seed, denoise_mask,
     ) -> Tensor:
         """1st-order Euler step (1 model evaluation)."""
         s_in = x.new_ones([x.shape[0]])
-        denoised = model_k(x, sigma * s_in, model_options=model_options, seed=seed)
+        denoised = model_k(x, sigma * s_in, denoise_mask, model_options=model_options, seed=seed)
         d = self._to_d(x, sigma * s_in, denoised)
         return x + d * (sigma_next - sigma)
 
