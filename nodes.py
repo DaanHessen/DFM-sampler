@@ -14,6 +14,7 @@ import torch
 
 import comfy.samplers  # type: ignore[import-untyped]
 import comfy.sample  # type: ignore[import-untyped]
+import comfy.model_management
 import latent_preview
 
 from .dfm_sampler import DFMSampler, apply_dilation
@@ -62,6 +63,10 @@ class DFMSamplerNode:
                     "default": True,
                     "tooltip": "RK4 (4 evals/step) or Euler (1 eval/step).",
                 }),
+                "low_vram_optimization": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Offload math to CPU & accumulate RK4 sequentially. Auto-enabled if VRAM <= 12GB.",
+                }),
             },
         }
 
@@ -84,9 +89,15 @@ class DFMSamplerNode:
         fft_injection_strength: float,
         fft_highpass_ratio: float,
         use_rk4: bool,
+        low_vram_optimization: bool,
     ):
         latent = latent_image["samples"].clone()
         device = model.load_device
+
+        # --- Auto-detect low VRAM ---
+        total_vram = comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
+        auto_low_vram = total_vram <= (12.5 * 1024 * 1024 * 1024)
+        effective_low_vram = low_vram_optimization or auto_low_vram
 
         # --- Noise ---
         noise = comfy.sample.prepare_noise(latent, seed)
@@ -101,6 +112,7 @@ class DFMSamplerNode:
             fft_highpass_ratio=fft_highpass_ratio,
             covariance_weight=0.0,
             use_rk4=use_rk4,
+            effective_low_vram=effective_low_vram,
         )
 
         # --- Compute dilated sigma schedule ---
@@ -173,6 +185,10 @@ class DFMInpaintSamplerNode:
                 "use_rk4": ("BOOLEAN", {
                     "default": True,
                 }),
+                "low_vram_optimization": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Offload math to CPU & accumulate RK4 sequentially. Auto-enabled if VRAM <= 12GB.",
+                }),
             },
         }
 
@@ -197,9 +213,15 @@ class DFMInpaintSamplerNode:
         fft_highpass_ratio: float,
         covariance_weight: float,
         use_rk4: bool,
+        low_vram_optimization: bool,
     ):
         latent = latent_image["samples"].clone()
         device = model.load_device
+
+        # --- Auto-detect low VRAM ---
+        total_vram = comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
+        auto_low_vram = total_vram <= (12.5 * 1024 * 1024 * 1024)
+        effective_low_vram = low_vram_optimization or auto_low_vram
 
         # --- Noise ---
         noise = comfy.sample.prepare_noise(latent, seed)
@@ -217,6 +239,7 @@ class DFMInpaintSamplerNode:
             fft_highpass_ratio=fft_highpass_ratio,
             covariance_weight=covariance_weight,
             use_rk4=use_rk4,
+            effective_low_vram=effective_low_vram,
         )
 
         # --- Sigmas ---

@@ -23,6 +23,7 @@ import torch
 from torch import Tensor
 import comfy.samplers  # type: ignore[import-untyped]
 from comfy.utils import model_trange as trange
+import comfy.model_management
 
 
 class DFMSampler(comfy.samplers.Sampler):
@@ -39,12 +40,14 @@ class DFMSampler(comfy.samplers.Sampler):
         fft_highpass_ratio: float = 0.35,
         covariance_weight: float = 0.0,
         use_rk4: bool = True,
+        effective_low_vram: bool = False,
     ) -> None:
         self.dilation_strength = max(0.0, min(dilation_strength, 1.0))
         self.fft_injection_strength = max(0.0, fft_injection_strength)
         self.fft_highpass_ratio = max(0.0, min(fft_highpass_ratio, 1.0))
         self.covariance_weight = max(0.0, min(covariance_weight, 1.0))
         self.use_rk4 = use_rk4
+        self.effective_low_vram = effective_low_vram
 
     # ------------------------------------------------------------------ #
     #  Sampler interface (called by CFGGuider.inner_sample)
@@ -120,6 +123,9 @@ class DFMSampler(comfy.samplers.Sampler):
                     "denoised": denoised,
                 })
 
+            if self.effective_low_vram:
+                comfy.model_management.soft_empty_cache()
+
         x = model_wrap.inner_model.model_sampling.inverse_noise_scaling(
             sigmas[-1], x,
         )
@@ -150,16 +156,47 @@ class DFMSampler(comfy.samplers.Sampler):
         def f(x_in: Tensor, s: Tensor) -> Tensor:
             s_safe = s.clamp(min=1e-7)
             denoised = model_k(x_in, s_safe * s_in, denoise_mask, model_options=model_options, seed=seed)
+            if self.effective_low_vram:
+                comfy.model_management.soft_empty_cache()
             denoised_cache["latest"] = denoised
-            return self._to_d(x_in, s_safe * s_in, denoised)
+            d = self._to_d(x_in, s_safe * s_in, denoised)
+            if self.effective_low_vram:
+                del denoised
+            return d
 
         s_mid = sigma + 0.5 * h
         k1 = f(x, sigma)
-        k2 = f(x + 0.5 * h * k1, s_mid)
-        k3 = f(x + 0.5 * h * k2, s_mid)
-        k4 = f(x + h * k3, sigma_next)
 
-        return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), denoised_cache["latest"]
+        if self.effective_low_vram:
+            x_next = x + (h / 6.0) * k1
+            x_mid = x + 0.5 * h * k1
+            del k1
+            comfy.model_management.soft_empty_cache()
+
+            k2 = f(x_mid, s_mid)
+            x_next += (h / 6.0) * 2.0 * k2
+            x_mid = x + 0.5 * h * k2
+            del k2
+            comfy.model_management.soft_empty_cache()
+
+            k3 = f(x_mid, s_mid)
+            x_next += (h / 6.0) * 2.0 * k3
+            x_end = x + h * k3
+            del k3
+            comfy.model_management.soft_empty_cache()
+
+            k4 = f(x_end, sigma_next)
+            x_next += (h / 6.0) * k4
+            del k4
+            comfy.model_management.soft_empty_cache()
+
+            return x_next, denoised_cache["latest"]
+        else:
+            k2 = f(x + 0.5 * h * k1, s_mid)
+            k3 = f(x + 0.5 * h * k2, s_mid)
+            k4 = f(x + h * k3, sigma_next)
+
+            return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), denoised_cache["latest"]
 
     @torch.inference_mode()
     def _euler_step(
@@ -181,6 +218,10 @@ class DFMSampler(comfy.samplers.Sampler):
         if self.fft_injection_strength <= 0.0:
             return x
 
+        device = x.device
+        if self.effective_low_vram:
+            x = x.cpu()
+
         H, W = x.shape[-2:]
         x_freq = torch.fft.rfft2(x, norm="ortho")
 
@@ -199,17 +240,26 @@ class DFMSampler(comfy.samplers.Sampler):
 
         amplification = 1.0 + self.fft_injection_strength * highpass_mask
         x_freq_boosted = x_freq * amplification
-        return torch.fft.irfft2(x_freq_boosted, s=(H, W), norm="ortho")
+        result = torch.fft.irfft2(x_freq_boosted, s=(H, W), norm="ortho")
+        
+        if self.effective_low_vram:
+            result = result.to(device)
+            
+        return result
 
     # ------------------------------------------------------------------ #
     #  Continuous Covariance Matching
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _covariance_match(x: Tensor, mask: Tensor, weight: float) -> Tensor:
+    def _covariance_match(self, x: Tensor, mask: Tensor, weight: float) -> Tensor:
         """Per-channel affine covariance matching between masked/unmasked regions."""
         if weight <= 0.0:
             return x
+
+        device = x.device
+        if self.effective_low_vram:
+            x = x.cpu()
+            mask = mask.cpu()
 
         mask_f = mask.float()
         if mask_f.ndim < x.ndim:
@@ -238,6 +288,10 @@ class DFMSampler(comfy.samplers.Sampler):
         mask_bool = mask_f.bool()
         x_out = x.clone()
         x_out[mask_bool] = x[mask_bool] * (1.0 - weight) + x_matched[mask_bool] * weight
+        
+        if self.effective_low_vram:
+            x_out = x_out.to(device)
+            
         return x_out
 
 
