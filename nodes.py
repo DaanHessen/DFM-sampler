@@ -115,7 +115,7 @@ class DFMSamplerNode:
         latent = comfy.sample.fix_empty_latent_channels(model, latent)
 
         # --- Run sampling through the full ComfyUI pipeline ---
-        result = guider.outer_sample(
+        result = guider.sample(
             noise, latent, sampler, sigmas,
             denoise_mask=noise_mask,
             callback=None,
@@ -226,7 +226,7 @@ class DFMInpaintSamplerNode:
 
         latent = comfy.sample.fix_empty_latent_channels(model, latent)
 
-        result = guider.outer_sample(
+        result = guider.sample(
             noise, latent, sampler, sigmas,
             denoise_mask=noise_mask,
             callback=None,
