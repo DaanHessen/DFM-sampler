@@ -1,0 +1,3 @@
+# DFM-Solver relies on packages already present in the ComfyUI environment.
+# No additional installations are required.
+torch
