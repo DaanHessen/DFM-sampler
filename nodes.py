@@ -16,31 +16,13 @@ output a LATENT.
 from __future__ import annotations
 
 import torch
-from torch import Tensor
 
-from .dfm_sampler import DFMSolver, build_model_fn
+import comfy.model_management  # type: ignore[import-untyped]
 
+from .dfm_sampler import DFMSolver
 
-# =========================================================================
-#  Shared Constants
-# =========================================================================
 
 CATEGORY = "sampling/dfm"
-
-
-# =========================================================================
-#  Helper — prepare conditioning for the model wrapper
-# =========================================================================
-
-def _prepare_cond(conditioning):
-    """Extract the tensor payload from ComfyUI conditioning format.
-
-    ComfyUI conditioning is a list of ``[tensor, dict]`` pairs. For simple
-    use-cases we only need the first entry's tensor.
-    """
-    if isinstance(conditioning, list) and len(conditioning) > 0:
-        return conditioning[0][0]
-    return conditioning
 
 
 # =========================================================================
@@ -49,11 +31,7 @@ def _prepare_cond(conditioning):
 
 class DFMSamplerNode:
     """ComfyUI node wrapping the Dilated Flow-Matching Solver for standard
-    text-to-image and image-to-image generation.
-
-    This replaces the KSampler in workflows using flow-matching / velocity-field
-    models (MMDiT, Flux, SD3, etc.).
-    """
+    text-to-image and image-to-image generation."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -64,62 +42,32 @@ class DFMSamplerNode:
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xFFFFFFFFFFFFFFFF,
+                    "default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
                     "tooltip": "Random seed for the initial noise.",
                 }),
                 "steps": ("INT", {
-                    "default": 20,
-                    "min": 1,
-                    "max": 200,
-                    "step": 1,
-                    "tooltip": "Number of solver steps. More steps = higher fidelity.",
+                    "default": 20, "min": 1, "max": 200, "step": 1,
+                    "tooltip": "Number of solver steps. More = higher fidelity.",
                 }),
                 "cfg": ("FLOAT", {
-                    "default": 7.5,
-                    "min": 0.0,
-                    "max": 30.0,
-                    "step": 0.5,
+                    "default": 7.5, "min": 0.0, "max": 30.0, "step": 0.5,
                     "tooltip": "Classifier-Free Guidance scale.",
                 }),
                 "dilation_strength": ("FLOAT", {
-                    "default": 0.7,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": (
-                        "Timestep dilation strength. 0 = uniform steps, "
-                        "1 = full cosine dilation (concentrates steps in the "
-                        "high-curvature mid-region of the ODE trajectory)."
-                    ),
+                    "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Timestep dilation. 0 = uniform, 1 = full cosine.",
                 }),
                 "fft_injection_strength": ("FLOAT", {
-                    "default": 0.15,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01,
-                    "tooltip": (
-                        "High-frequency detail injection via spectral amplification. "
-                        "0 = disabled, 0.1–0.25 = subtle sharpening, >0.4 = aggressive."
-                    ),
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "High-frequency detail injection. 0 = off.",
                 }),
                 "fft_highpass_ratio": ("FLOAT", {
-                    "default": 0.35,
-                    "min": 0.05,
-                    "max": 0.95,
-                    "step": 0.05,
-                    "tooltip": (
-                        "Cutoff for the high-pass filter as a fraction of the max "
-                        "frequency radius. Lower = more frequencies affected."
-                    ),
+                    "default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05,
+                    "tooltip": "High-pass filter cutoff ratio.",
                 }),
                 "use_rk4": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": (
-                        "Use 4th-order Runge-Kutta integrator (4 model evals/step). "
-                        "Disable to fall back to Euler (1 eval/step, lower quality)."
-                    ),
+                    "tooltip": "RK4 (4 evals/step) or Euler (1 eval/step).",
                 }),
             },
         }
@@ -143,23 +91,18 @@ class DFMSamplerNode:
         fft_highpass_ratio: float,
         use_rk4: bool,
     ):
-        """Execute the DFM sampling loop and return the denoised latent."""
-        # --- Unpack the ComfyUI latent dict ---
-        latent = latent_image["samples"].clone()
         device = model.load_device
-        dtype = model.model.model_dtype() if hasattr(model.model, "model_dtype") else torch.float32
+        latent = latent_image["samples"].clone()
 
-        # --- Seed & initial noise ---
+        # --- Get sigma range from the model's sampling config ---
+        model_sampling = model.get_model_object("model_sampling")
+        sigma_max = model_sampling.sigma_max.item()
+        sigma_min = model_sampling.sigma_min.item()
+
+        # --- Generate noise ---
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        noise = torch.randn(
-            latent.shape, generator=generator, device="cpu", dtype=dtype,
-        )
-        x = noise.to(device)
-
-        # --- Build model function with CFG ---
-        pos_cond = _prepare_cond(positive)
-        neg_cond = _prepare_cond(negative)
-        model_fn = build_model_fn(model, pos_cond, neg_cond, cfg_scale=cfg)
+        noise = torch.randn(latent.shape, generator=generator, device="cpu")
+        x = (noise * sigma_max).to(device)
 
         # --- Initialise solver ---
         solver = DFMSolver(
@@ -167,15 +110,19 @@ class DFMSamplerNode:
             dilation_strength=dilation_strength,
             fft_injection_strength=fft_injection_strength,
             fft_highpass_ratio=fft_highpass_ratio,
-            covariance_weight=0.0,  # no inpainting for this node
+            covariance_weight=0.0,
         )
+
+        sigmas = solver.compute_sigmas(sigma_min, sigma_max, device)
 
         # --- Run ---
         result = solver.sample(
-            model_fn=model_fn,
+            model=model,
             x=x,
-            sigma_min=0.0,
-            sigma_max=1.0,
+            sigmas=sigmas,
+            positive=positive,
+            negative=negative,
+            cfg_scale=cfg,
             use_rk4=use_rk4,
         )
 
@@ -189,9 +136,7 @@ class DFMSamplerNode:
 class DFMInpaintSamplerNode:
     """ComfyUI node for inpainting with the DFM-Solver.
 
-    Extends the base sampler with mask-aware covariance matching that forces
-    newly generated regions to adopt the color and lighting distribution of
-    the unmasked original.
+    Adds mask-aware covariance matching for color/lighting coherence.
     """
 
     @classmethod
@@ -204,60 +149,30 @@ class DFMInpaintSamplerNode:
                 "latent_image": ("LATENT",),
                 "mask": ("MASK",),
                 "seed": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xFFFFFFFFFFFFFFFF,
+                    "default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
                     "tooltip": "Random seed for the initial noise.",
                 }),
                 "steps": ("INT", {
-                    "default": 20,
-                    "min": 1,
-                    "max": 200,
-                    "step": 1,
-                    "tooltip": "Number of solver steps.",
+                    "default": 20, "min": 1, "max": 200, "step": 1,
                 }),
                 "cfg": ("FLOAT", {
-                    "default": 7.5,
-                    "min": 0.0,
-                    "max": 30.0,
-                    "step": 0.5,
-                    "tooltip": "Classifier-Free Guidance scale.",
+                    "default": 7.5, "min": 0.0, "max": 30.0, "step": 0.5,
                 }),
                 "dilation_strength": ("FLOAT", {
-                    "default": 0.7,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": "Timestep dilation strength.",
+                    "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
                 }),
                 "fft_injection_strength": ("FLOAT", {
-                    "default": 0.15,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.01,
-                    "tooltip": "High-frequency spectral injection strength.",
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01,
                 }),
                 "fft_highpass_ratio": ("FLOAT", {
-                    "default": 0.35,
-                    "min": 0.05,
-                    "max": 0.95,
-                    "step": 0.05,
-                    "tooltip": "High-pass filter cutoff ratio.",
+                    "default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05,
                 }),
                 "covariance_weight": ("FLOAT", {
-                    "default": 0.6,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": (
-                        "How strongly to match the generated region's color/lighting "
-                        "to the original. 0 = disabled, 0.4–0.7 = recommended for "
-                        "natural blending, 1.0 = full statistical matching."
-                    ),
+                    "default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Color/lighting matching strength. 0 = off.",
                 }),
                 "use_rk4": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Use RK4 (4 evals/step) or Euler (1 eval/step).",
                 }),
             },
         }
@@ -283,39 +198,34 @@ class DFMInpaintSamplerNode:
         covariance_weight: float,
         use_rk4: bool,
     ):
-        """Execute the DFM inpainting sampling loop."""
-        # --- Unpack ---
-        latent = latent_image["samples"].clone()
         device = model.load_device
-        dtype = model.model.model_dtype() if hasattr(model.model, "model_dtype") else torch.float32
+        latent = latent_image["samples"].clone()
 
-        # --- Prepare mask [B, 1, H, W] ---
-        mask_tensor = mask.clone().to(device=device, dtype=dtype)
-        if mask_tensor.dim() == 2:
-            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
-        elif mask_tensor.dim() == 3:
-            mask_tensor = mask_tensor.unsqueeze(1)
-        # Resize mask to match latent spatial dims if needed
+        # --- Get sigma range ---
+        model_sampling = model.get_model_object("model_sampling")
+        sigma_max = model_sampling.sigma_max.item()
+        sigma_min = model_sampling.sigma_min.item()
+
+        # --- Prepare mask to match latent spatial dims ---
+        mask_tensor = mask.clone().to(device=device, dtype=torch.float32)
+        # Ensure mask is [B, 1, ...spatial...]
+        while mask_tensor.ndim < latent.ndim:
+            mask_tensor = mask_tensor.unsqueeze(1 if mask_tensor.ndim >= 1 else 0)
+        # Resize spatial dims if needed
         if mask_tensor.shape[-2:] != latent.shape[-2:]:
             mask_tensor = torch.nn.functional.interpolate(
-                mask_tensor, size=latent.shape[-2:], mode="nearest",
+                mask_tensor.float(),
+                size=latent.shape[-2:],
+                mode="nearest",
             )
 
         # --- Seed & initial noise ---
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        noise = torch.randn(
-            latent.shape, generator=generator, device="cpu", dtype=dtype,
-        )
-        # Start from noise in masked region, original content in unmasked
+        noise = torch.randn(latent.shape, generator=generator, device="cpu")
         original_latent = latent.to(device)
-        x = noise.to(device)
+        x = (noise * sigma_max).to(device)
 
-        # --- Build model function ---
-        pos_cond = _prepare_cond(positive)
-        neg_cond = _prepare_cond(negative)
-        model_fn = build_model_fn(model, pos_cond, neg_cond, cfg_scale=cfg)
-
-        # --- Initialise solver ---
+        # --- Solver ---
         solver = DFMSolver(
             steps=steps,
             dilation_strength=dilation_strength,
@@ -324,12 +234,15 @@ class DFMInpaintSamplerNode:
             covariance_weight=covariance_weight,
         )
 
-        # --- Run ---
+        sigmas = solver.compute_sigmas(sigma_min, sigma_max, device)
+
         result = solver.sample(
-            model_fn=model_fn,
+            model=model,
             x=x,
-            sigma_min=0.0,
-            sigma_max=1.0,
+            sigmas=sigmas,
+            positive=positive,
+            negative=negative,
+            cfg_scale=cfg,
             mask=mask_tensor,
             original_latent=original_latent,
             use_rk4=use_rk4,
