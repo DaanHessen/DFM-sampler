@@ -50,6 +50,7 @@ class DFMSampler(comfy.samplers.Sampler):
     #  Sampler interface (called by CFGGuider.inner_sample)
     # ------------------------------------------------------------------ #
 
+    @torch.inference_mode()
     def sample(
         self,
         model_wrap,
@@ -135,6 +136,7 @@ class DFMSampler(comfy.samplers.Sampler):
         s = sigma.reshape(-1, *([1] * (x.ndim - 1)))
         return (x - denoised) / s.clamp(min=1e-7)
 
+    @torch.inference_mode()
     def _rk4_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
         model_options: dict, seed, denoise_mask,
@@ -159,6 +161,7 @@ class DFMSampler(comfy.samplers.Sampler):
 
         return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), denoised_cache["latest"]
 
+    @torch.inference_mode()
     def _euler_step(
         self, model_k, x: Tensor, sigma: Tensor, sigma_next: Tensor,
         model_options: dict, seed, denoise_mask,
