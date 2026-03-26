@@ -208,16 +208,21 @@ class DFMInpaintSamplerNode:
 
         # --- Prepare mask to match latent spatial dims ---
         mask_tensor = mask.clone().to(device=device, dtype=torch.float32)
-        # Ensure mask is [B, 1, ...spatial...]
-        while mask_tensor.ndim < latent.ndim:
-            mask_tensor = mask_tensor.unsqueeze(1 if mask_tensor.ndim >= 1 else 0)
-        # Resize spatial dims if needed
-        if mask_tensor.shape[-2:] != latent.shape[-2:]:
+        # Normalise to [B, 1, H, W] regardless of input shape
+        if mask_tensor.ndim == 2:       # [H, W]
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+        elif mask_tensor.ndim == 3:     # [B, H, W]
+            mask_tensor = mask_tensor.unsqueeze(1)
+        # mask_tensor is now [B, 1, H, W] — resize spatially
+        latent_spatial = latent.shape[-2:]
+        if mask_tensor.shape[-2:] != latent_spatial:
             mask_tensor = torch.nn.functional.interpolate(
-                mask_tensor.float(),
-                size=latent.shape[-2:],
-                mode="nearest",
+                mask_tensor, size=latent_spatial, mode="nearest",
             )
+        # For 5-D latents (e.g. Wan / video models: [B, C, T, H, W]),
+        # insert a temporal dim so mask becomes [B, 1, 1, H, W]
+        if latent.ndim == 5 and mask_tensor.ndim == 4:
+            mask_tensor = mask_tensor.unsqueeze(2)
 
         # --- Seed & initial noise ---
         generator = torch.Generator(device="cpu").manual_seed(seed)
